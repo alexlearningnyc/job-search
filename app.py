@@ -278,7 +278,7 @@ with st.sidebar:
     
     model_choice = st.selectbox(
         "Gemini Model",
-        options=["gemini-3.8-flash-preview", "gemini-4-argon-preview", "gemini-3.1-pro-preview"],
+        options=["gemini-3.8-flash", "gemini-4-argon", "gemini-3.1-pro"],
         index=0,
         help="Select model for agent search and ATS auditing.",
     )
