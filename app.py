@@ -59,6 +59,7 @@ def extract_text_from_upload(uploaded_file) -> Tuple[str, str]:
 
 
 def fetch_clean_webpage_text(url: str, max_chars: int = 8000) -> str:
+    """Attempts to scrape the full job description from a direct ATS URL."""
     try:
         headers = {"User-Agent": "Mozilla/5.0 (compatible; CareerAgent/1.0)"}
         resp = requests.get(url, headers=headers, timeout=8)
@@ -73,21 +74,43 @@ def fetch_clean_webpage_text(url: str, max_chars: int = 8000) -> str:
     return ""
 
 
-# Helper to check model availability via API
-@st.cache_data(ttl=300)
-def check_model_availability(api_key: str, selected_model: str) -> bool:
+@st.cache_data(ttl=120, show_spinner=False)
+def check_model_availability(api_key: str, selected_model: str) -> Tuple[str, str]:
+    """
+    Sends a 1-token test request to verify both model existence AND active quota (> 0)
+    before running the main pipeline.
+    Returns: (status_type, message) where status_type is 'ok', 'zero_quota', 'rate_limit', or 'error'
+    """
     if not api_key:
-        return False
+        return "error", "Enter your Gemini API key first."
     try:
         client = genai.Client(api_key=api_key)
-        models = client.models.list()
-        for m in models:
-            # Check matching name (e.g. models/gemini-3.8-flash or gemini-3.8-flash)
-            if selected_model in getattr(m, "name", ""):
-                return True
-        return False
-    except Exception:
-        return False
+        client.models.generate_content(
+            model=selected_model,
+            contents="ping",
+            config=types.GenerateContentConfig(max_output_tokens=1),
+        )
+        return "ok", f"Model `{selected_model}` is active and has available quota!"
+    except Exception as e:
+        err_str = str(e)
+        if "limit: 0" in err_str:
+            return (
+                "zero_quota",
+                f"Blocked on Free Tier (`limit: 0`). `{selected_model}` requires a Paid Tier billing account, "
+                "or switch to `gemini-3.8-flash` / `gemini-2.5-flash`.",
+            )
+        elif "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            return (
+                "rate_limit",
+                f"Rate limit reached on `{selected_model}` (429). Wait 60 seconds or switch models.",
+            )
+        elif "404" in err_str or "NOT_FOUND" in err_str:
+            return (
+                "error",
+                f"Model `{selected_model}` was not found on this API endpoint.",
+            )
+        else:
+            return "error", f"Unavailable: {err_str[:140]}..."
 
 
 # =====================================================================
@@ -128,7 +151,7 @@ class BatchJobAuditResponse(BaseModel):
 
 
 # =====================================================================
-# 3. GEMINI API PIPELINE
+# 3. GEMINI API PIPELINE (SEARCH GROUNDING + DEEP ATS AUDIT)
 # =====================================================================
 def run_search_and_audit_pipeline(
     api_key: str,
@@ -144,6 +167,9 @@ def run_search_and_audit_pipeline(
 ) -> BatchJobAuditResponse:
     client = genai.Client(api_key=api_key)
 
+    # -----------------------------------------------------------------
+    # STAGE 1: Live Web Search with Google Search Grounding
+    # -----------------------------------------------------------------
     search_prompt = f"""
     You are an autonomous career research agent. Search the live web and direct ATS platforms
     (such as job-boards.greenhouse.io, jobs.lever.co, jobs.ashbyhq.com, myworkdayjobs.com, and direct
@@ -161,8 +187,13 @@ def run_search_and_audit_pipeline(
     7. URL RULE: Strictly EXCLUDE aggregator links (LinkedIn, Indeed, Glassdoor, ZipRecruiter, BuiltIn).
        Provide ONLY direct company career page or direct ATS board URLs.
 
-    For each of the {num_jobs} roles found, provide Company Name, Exact Job Title, Location / Work Style, 
-    Compensation Range, Direct Application URL, and a detailed summary of required skills and qualifications.
+    For each of the {num_jobs} roles found, provide:
+    - Company Name
+    - Exact Job Title
+    - Location / Work Style
+    - Compensation Range
+    - Direct Application URL
+    - Detailed summary of required skills, tools, responsibilities, and qualifications from the posting.
     """
 
     search_response = client.models.generate_content(
@@ -184,25 +215,37 @@ def run_search_and_audit_pipeline(
                 grounded_urls.append(f"- {chunk.web.title}: {chunk.web.uri}")
     grounded_urls_text = "\n".join(grounded_urls)
 
+    # -----------------------------------------------------------------
+    # STAGE 2: Structured ATS Resume Audit against CS & PM Resumes
+    # -----------------------------------------------------------------
     audit_prompt = f"""
-    You are an expert enterprise Applicant Tracking System (ATS) algorithm.
+    You are an expert enterprise Applicant Tracking System (ATS) algorithm (modeled after Greenhouse, Lever, and Workday screening engines).
+
+    Below are the candidate's two reference resumes:
 
     === CANDIDATE RESUME 1: CUSTOMER SUCCESS (CS) RESUME ===
-    {cs_resume if cs_resume.strip() else "[Standard mid-level CS baseline]"}
+    {cs_resume if cs_resume.strip() else "[No custom CS resume uploaded yet - evaluate against a standard mid-level CS Manager baseline with SaaS onboarding, retention, QBRs, and CRM experience]"}
 
     === CANDIDATE RESUME 2: PROJECT MANAGEMENT (PM) RESUME ===
-    {pm_resume if pm_resume.strip() else "[Standard mid-level PM baseline]"}
+    {pm_resume if pm_resume.strip() else "[No custom PM resume uploaded yet - evaluate against a standard mid-level PM baseline with Initiation, Planning, Execution, Monitoring, Closure, and cross-functional stakeholder alignment]"}
 
     === LIVE SEARCH RESULTS & JOB DESCRIPTIONS ===
     {raw_search_findings}
 
-    === VERIFIED GROUNDED URLS ===
+    === VERIFIED GROUNDED URLS FROM GOOGLE SEARCH ===
     {grounded_urls_text}
 
     TASK:
-    Compile up to {num_jobs} roles matching all criteria. For each role, select the better-fitting resume track,
-    calculate the weighted ATS score, identify matched/missing keywords, and provide 2-3 ready-to-paste bullet edits
-    to reach a 90%-95% match score.
+    Compile the discovered roles (up to {num_jobs} roles that strictly pass all exclusions: no Senior titles, <5 yrs required exp, no niche vertical tool mandates like HRIS/wealth management, >=${min_salary:,} base).
+
+    For EACH role:
+    1. Select whichever resume ('Customer Success Resume' or 'Project Management Resume') is the stronger natural fit.
+    2. Score the selected resume like an ATS using this exact weighting:
+       - Hard Skills & Software Stack (40%)
+       - Core Responsibilities & Lifecycle Keywords (35%)
+       - Experience & Scope Match (15%)
+       - Quantifiable Impact & Metrics (10%)
+    3. Provide the Initial ATS Score, Matched Keywords, Missing Critical Keywords, and 2-3 Ready-to-Paste Rewritten Resume Bullets that raise the score to 90%-95%.
     """
 
     structured_response = client.models.generate_content(
@@ -231,18 +274,19 @@ def run_single_job_audit(
     combined_jd = f"URL: {job_url}\n\nScraped Page Content:\n{scraped_text}\n\nUser Pasted JD:\n{job_text_override}"
 
     prompt = f"""
-    Act as an enterprise ATS screening engine. Audit this single job posting against candidate resumes.
+    Act as an enterprise ATS screening engine. Audit the following single job posting against the candidate's two resumes.
+    Automatically select whichever resume ('Customer Success Resume' or 'Project Management Resume') scores higher.
 
     === CUSTOMER SUCCESS RESUME ===
-    {cs_resume if cs_resume.strip() else "[Standard mid-level CS profile]"}
+    {cs_resume if cs_resume.strip() else "[Standard mid-level Customer Success profile]"}
 
     === PROJECT MANAGEMENT RESUME ===
-    {pm_resume if pm_resume.strip() else "[Standard mid-level PM profile]"}
+    {pm_resume if pm_resume.strip() else "[Standard mid-level Project Management profile]"}
 
     === TARGET JOB POSTING ===
     {combined_jd}
 
-    Provide complete ATS audit, rubric breakdown, keyword gap matrix, and 3 resume bullet rewrites to reach 90%-95%.
+    Provide a complete ATS audit, weighted rubric breakdown, exact keyword gap matrix, and 3 ready-to-paste resume bullet rewrites to reach a 90%-95% match score.
     """
 
     resp = client.models.generate_content(
@@ -275,24 +319,41 @@ with st.sidebar:
         type="password",
         help="Get your key from aistudio.google.com",
     )
-    
+
     model_choice = st.selectbox(
         "Gemini Model",
-        options=["gemini-3.8-flash", "gemini-4-argon", "gemini-3.1-pro"],
+        options=[
+            "gemini-3.8-flash",
+            "gemini-2.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-pro-preview",
+            "gemini-2.5-pro",
+            "gemini-4-argon",
+        ],
         index=0,
-        help="Select model for agent search and ATS auditing.",
+        help="Flash models work on the Free Tier. Pro/Argon models typically require Tier 1 billing.",
     )
 
-    # Real-time model availability check BEFORE running prompts
+    # Real-time 1-token quota check BEFORE running the pipeline
+    model_ready = False
     if api_key_input:
-        with st.spinner("Checking model availability..."):
-            is_available = check_model_availability(api_key_input, model_choice)
-        if is_available:
-            st.success(f"✅ Model `{model_choice}` is active & accessible")
+        with st.spinner(f"Verifying quota for {model_choice}..."):
+            status_type, status_msg = check_model_availability(api_key_input, model_choice)
+        if status_type == "ok":
+            st.success(f"✅ {status_msg}")
+            model_ready = True
+        elif status_type == "zero_quota":
+            st.error(f"🚫 {status_msg}")
+        elif status_type == "rate_limit":
+            st.warning(f"⏳ {status_msg}")
         else:
-            st.warning(f"⚠️ Model `{model_choice}` status unverified / requires permissions")
+            st.error(f"❌ {status_msg}")
+
+        if st.button("🔄 Re-test Model Quota", use_container_width=True):
+            check_model_availability.clear()
+            st.rerun()
     else:
-        st.info("ℹ️ Enter API key to verify model availability.")
+        st.info("ℹ️ Enter API key to verify model quota.")
 
     st.divider()
     st.subheader("🎯 Search Criteria")
@@ -350,34 +411,41 @@ tab_batch, tab_single, tab_resumes = st.tabs([
 with tab_batch:
     col_btn, col_info = st.columns([1, 3])
     with col_btn:
-        run_btn = st.button("🚀 Run Live Search & ATS Audit", type="primary", use_container_width=True)
-    with col_info:
-        st.info(
-            f"Searches ATS boards using **{model_choice}** for roles posted in the last "
-            f"**{days_posted} days** paying **${min_salary:,}+**."
+        run_btn = st.button(
+            "🚀 Run Live Search & ATS Audit",
+            type="primary",
+            use_container_width=True,
+            disabled=not model_ready,
         )
+    with col_info:
+        if model_ready:
+            st.info(
+                f"Ready! Searching ATS boards with **{model_choice}** for roles posted in the last "
+                f"**{days_posted} days** paying **${min_salary:,}+**."
+            )
+        else:
+            st.warning(
+                "Select an active model with available quota in the left sidebar (e.g., `gemini-3.8-flash` or `gemini-2.5-flash`) to enable the search button."
+            )
 
     if run_btn:
-        if not api_key_input:
-            st.error("Please enter your Gemini API Key in the sidebar first.")
-        else:
-            with st.spinner(f"Running live search & ATS audits with {model_choice}..."):
-                try:
-                    results = run_search_and_audit_pipeline(
-                        api_key=api_key_input,
-                        model_name=model_choice,
-                        cs_resume=st.session_state["cs_resume"],
-                        pm_resume=st.session_state["pm_resume"],
-                        num_jobs=num_jobs,
-                        min_salary=min_salary,
-                        days_posted=days_posted,
-                        roles_list=selected_roles,
-                        locations_list=selected_locations,
-                        exclusions_text=exclusions_text,
-                    )
-                    st.session_state["last_batch_results"] = results
-                except Exception as e:
-                    st.error(f"Error running pipeline: {e}")
+        with st.spinner(f"Running live search & ATS audits with {model_choice}..."):
+            try:
+                results = run_search_and_audit_pipeline(
+                    api_key=api_key_input,
+                    model_name=model_choice,
+                    cs_resume=st.session_state["cs_resume"],
+                    pm_resume=st.session_state["pm_resume"],
+                    num_jobs=num_jobs,
+                    min_salary=min_salary,
+                    days_posted=days_posted,
+                    roles_list=selected_roles,
+                    locations_list=selected_locations,
+                    exclusions_text=exclusions_text,
+                )
+                st.session_state["last_batch_results"] = results
+            except Exception as e:
+                st.error(f"Error running pipeline: {e}")
 
     if "last_batch_results" in st.session_state and st.session_state["last_batch_results"].jobs:
         jobs_list: List[JobAuditItem] = st.session_state["last_batch_results"].jobs
@@ -459,10 +527,12 @@ with tab_single:
     single_url = st.text_input("Direct Job Posting URL (Greenhouse, Lever, Ashby, Company Page)")
     single_jd_text = st.text_area("Or Paste Full Job Description Text (Optional if URL is public)", height=180)
 
-    if st.button("🧪 Run Deep-Dive ATS Audit on This Role", type="primary"):
-        if not api_key_input:
-            st.error("Please enter your Gemini API Key in the sidebar.")
-        elif not single_url and not single_jd_text.strip():
+    if st.button(
+        "🧪 Run Deep-Dive ATS Audit on This Role",
+        type="primary",
+        disabled=not model_ready,
+    ):
+        if not single_url and not single_jd_text.strip():
             st.warning("Please provide either a job URL or paste the job description text.")
         else:
             with st.spinner(f"Scraping and auditing job with {model_choice}..."):
