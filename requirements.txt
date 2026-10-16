@@ -1,8 +1,0 @@
-streamlit
-google-genai
-pydantic
-pandas
-pypdf
-python-docx
-beautifulsoup4
-requests
